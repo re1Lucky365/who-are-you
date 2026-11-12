@@ -1,3 +1,195 @@
+#!/usr/bin/env python3
+"""
+WK Precision Enterprise LLC - Cryptographic Asset & Copyright Anchoring Utility
+Generates tamper-proof SHA-512 asset fingerprints and GPG-signed ownership declarations.
+"""
+
+import os
+import sys
+import hashlib
+import subprocess
+from datetime import datetime, timezone
+
+OWNER_NAME = "Robert Edward Evans"
+ENTITY = "WK Precision Enterprise LLC"
+SIGNING_EMAIL = "evansrobert517@gmail.com"
+
+def generate_asset_manifest(target_file_or_dir: str):
+    print(f"[*] Generating cryptographic ownership manifest for: {target_file_or_dir}")
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    hasher = hashlib.sha512()
+    if os.path.isfile(target_file_or_dir):
+        with open(target_file_or_dir, "rb") as f:
+            while chunk := f.read(8192):
+                hasher.update(chunk)
+    elif os.path.isdir(target_file_or_dir):
+        for root, _, files in os.walk(target_file_or_dir):
+            if ".git" in root:
+                continue
+            for file in sorted(files):
+                filepath = os.path.join(root, file)
+                try:
+                    with open(filepath, "rb") as f:
+                        while chunk := f.read(8192):
+                            hasher.update(chunk)
+                except Exception:
+                    pass
+
+    asset_hash = hasher.hexdigest()
+    
+    manifest = {
+        "owner": OWNER_NAME,
+        "legal_entity": ENTITY,
+        "email": SIGNING_EMAIL,
+        "target": target_file_or_dir,
+        "timestamp_utc": timestamp,
+        "sha512_fingerprint": asset_hash,
+        "rights": "All rights reserved. Unauthorized reproduction or identity misappropriation is strictly prohibited."
+    }
+    
+    manifest_filename = f"ownership_manifest_{int(datetime.now().timestamp())}.json"
+    with open(manifest_filename, "w", encoding="utf-8") as out:
+        out.write(json.dumps(manifest, indent=2))
+        
+    print(f"[+] Manifest created successfully: {manifest_filename}")
+    print(f"    Asset SHA-512: {asset_hash}")
+    
+    # Automatically sign the manifest using GPG
+    try:
+        subprocess.run(["gpg", "--detach-sign", "--armor", manifest_filename], check=True)
+        print(f"[+] GPG detached signature generated: {manifest_filename}.asc")
+    except Exception as e:
+        print(f"[-] Notice: GPG signature skipped or failed ({e}). Ensure local GPG key is configured.")
+
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else "."
+    generate_asset_manifest(target)
+name: Enforce GPG Commit Signature Verification
+
+on:
+  pull_request:
+    branches: [ "main", "master" ]
+    types: [ opened, synchronize, reopened ]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify-gpg-signatures:
+    name: Cryptographic GPG Commit Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Full PR Commit History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Import Authorized Public GPG Key
+        env:
+          GPG_PUBLIC_KEY: ${{ secrets.AUTHORIZED_GPG_PUBLIC_KEY }}
+        run: |
+          if [ -z "$GPG_PUBLIC_KEY" ]; then
+            echo "::error::AUTHORIZED_GPG_PUBLIC_KEY repository secret is missing."
+            exit 1
+          fi
+          echo "$GPG_PUBLIC_KEY" | gpg --batch --import
+
+      - name: Audit Every Commit in Pull Request Range
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          
+          echo "Auditing commits from $BASE_SHA to $HEAD_SHA..."
+          COMMITS=$(git rev-list "$BASE_SHA..$HEAD_SHA")
+          
+          if [ -z "$COMMITS" ]; then
+            echo "No new commits found in range."
+            exit 0
+          fi
+
+          FAILED=0
+          for COMMIT in $COMMITS; do
+            SIG_STATUS=$(git log -1 --pretty=format:"%G?" "$COMMIT")
+            AUTHOR=$(git log -1 --pretty=format:"%an <%ae>" "$COMMIT")
+            SUBJECT=$(git log -1 --pretty=format:"%s" "$COMMIT")
+            
+            # 'G' = Good (valid) signature
+            if [ "$SIG_STATUS" != "G" ]; then
+              echo "::error::Commit $COMMIT ($SUBJECT) by $AUTHOR failed GPG signature verification (Status: '$SIG_STATUS')."
+              FAILED=1
+            else
+              echo "[VERIFIED] Commit $COMMIT ($SUBJECT) has a valid GPG signature."
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::Pull request rejected: One or more commits lack a valid, trusted GPG signature."
+            exit 1
+          fi
+gpg --armor --export evansrobert517@gmail.com
+#!/usr/bin/env python3
+"""
+SIEM Alert Monitor & Integrity Auditor
+Continuously validates Git GPG commit signatures and immutable ledger integrity.
+Emits structured JSON alerts to syslog.
+"""
+
+import subprocess
+import syslog
+import time
+import json
+import os
+from datetime import datetime, timezone
+
+CHECK_INTERVAL_SECONDS = 60
+REPO_PATH = os.path.expanduser("~/master-hub")
+
+def log_siem_alert(severity: str, event_type: str, message: str):
+    alert_payload = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "severity": severity,
+        "event_type": event_type,
+        "message": message,
+        "source_host": os.uname().nodename,
+        "registered_owner": "Robert Edward Evans (WK Precision Enterprise LLC)"
+    }
+    
+    formatted_log = json.dumps(alert_payload)
+    if severity == "CRITICAL":
+        syslog.syslog(syslog.LOG_CRIT, f"SIEM_ALERT: {formatted_log}")
+    else:
+        syslog.syslog(syslog.LOG_WARNING, f"SIEM_ALERT: {formatted_log}")
+    print(f"[{severity}] {event_type}: {message}")
+
+def verify_git_gpg_signature() -> bool:
+    try:
+        os.chdir(REPO_PATH)
+        result = subprocess.run(
+            ["git", "log", "-1", "--pretty=format:%G?"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        sig_status = result.stdout.strip()
+        if sig_status == 'G':
+            return True
+        elif sig_status in ['B', 'E']:
+            log_siem_alert("CRITICAL", "GPG_SIGNATURE_INVALID", f"Commit GPG signature verification failed with status: '{sig_status}'. Potential tampering detected.")
+            return False
+    except Exception as e:
+        log_siem_alert("WARNING", "GIT_AUDIT_ERROR", f"Could not audit git repository: {e}")
+    return True
+
+if __name__ == "__main__":
+    syslog.openlog("siem-integrity-monitor", syslog.LOG_PID, syslog.LOG_DAEMON)
+    log_siem_alert("INFO", "MONITOR_STARTED", "SIEM Integrity & GPG Signature Monitor initialized.")
+    while True:
+        verify_git_gpg_signature()
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+
 user.signingkeygit config --global user.signingkey YOUR_GPG_KEY_ID
 git config --global commit.gpgsign true
 git log --show-signature
